@@ -3,7 +3,6 @@
 <head>
   <title>Data Search</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/dist/duckdb-browser-blocking.js"></script>
 </head>
 <body class="bg-gray-100 min-h-screen p-8">
   <div class="max-w-6xl mx-auto">
@@ -32,58 +31,61 @@
     <p id="count" class="text-gray-500 mt-4 text-sm"></p>
   </div>
 
-  <script>
-    (async () => {
-      try {
-        document.getElementById('status').textContent = 'Initializing...';
+  <script type="module">
+    import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm';
+
+    try {
+      const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
+      const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
+      const worker = new Worker(bundle.mainWorker);
+      const logger = new duckdb.ConsoleLogger();
+      const db = new duckdb.AsyncDuckDB(logger, worker);
+      await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+      const conn = await db.connect();
+
+      document.getElementById('status').textContent = '✓ Ready';
+      document.getElementById('status').classList.replace('text-gray-500', 'text-green-600');
+      document.getElementById('search').disabled = false;
+
+      document.getElementById('search').addEventListener('input', async (e) => {
+        const term = e.target.value.trim();
         
-        const duckdb = await window.duckdb.createDuckDB();
-        const conn = await duckdb.connect();
+        if (term.length < 2) { 
+          document.getElementById('results').innerHTML = ''; 
+          document.getElementById('count').textContent = '';
+          return; 
+        }
 
-        document.getElementById('status').textContent = '✓ Ready';
-        document.getElementById('status').classList.replace('text-gray-500', 'text-green-600');
-        document.getElementById('search').disabled = false;
+        try {
+          const result = await conn.query(`
+            SELECT * FROM 'data/*.parquet'
+            WHERE CAST(EVENTID AS VARCHAR) ILIKE '%${term}%'
+               OR CAST(Value AS VARCHAR) ILIKE '%${term}%'
+            LIMIT 100
+          `);
 
-        document.getElementById('search').addEventListener('input', async (e) => {
-          const term = e.target.value.trim();
+          const rows = result.toArray().map(r => r.toJSON());
           
-          if (term.length < 2) { 
-            document.getElementById('results').innerHTML = ''; 
-            document.getElementById('count').textContent = '';
-            return; 
-          }
-
-          try {
-            const result = await conn.query(`
-              SELECT * FROM 'data/*.parquet'
-              WHERE CAST(EVENTID AS VARCHAR) ILIKE '%${term}%'
-                 OR CAST(Value AS VARCHAR) ILIKE '%${term}%'
-              LIMIT 100
-            `);
-
-            const rows = result.toArray();
-            
-            document.getElementById('results').innerHTML = rows
-              .map(row => `
-                <tr class="hover:bg-gray-50 transition-colors">
-                  <td class="px-6 py-4 text-sm text-gray-900">${row.EVENTID}</td>
-                  <td class="px-6 py-4 text-sm text-gray-600">${row.VALID_START_TS}</td>
-                  <td class="px-6 py-4 text-sm text-gray-600">${row.Value}</td>
-                </tr>
-              `).join('');
-            
-            document.getElementById('count').textContent = `Showing ${rows.length} results`;
-          } catch (err) {
-            console.error(err);
-            document.getElementById('count').textContent = 'Query error: ' + err.message;
-          }
-        });
-      } catch (err) {
-        document.getElementById('status').textContent = 'Failed to load DuckDB: ' + err.message;
-        document.getElementById('status').classList.replace('text-gray-500', 'text-red-600');
-        console.error('DuckDB init error:', err);
-      }
-    })();
+          document.getElementById('results').innerHTML = rows
+            .map(row => `
+              <tr class="hover:bg-gray-50 transition-colors">
+                <td class="px-6 py-4 text-sm text-gray-900">${row.EVENTID}</td>
+                <td class="px-6 py-4 text-sm text-gray-600">${row.VALID_START_TS}</td>
+                <td class="px-6 py-4 text-sm text-gray-600">${row.Value}</td>
+              </tr>
+            `).join('');
+          
+          document.getElementById('count').textContent = `Showing ${rows.length} results`;
+        } catch (err) {
+          console.error(err);
+          document.getElementById('count').textContent = 'Error: ' + err.message;
+        }
+      });
+    } catch (err) {
+      document.getElementById('status').textContent = 'Error: ' + err.message;
+      document.getElementById('status').classList.add('text-red-600');
+      console.error(err);
+    }
   </script>
 </body>
 </html>
