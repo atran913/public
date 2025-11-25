@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Search</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 min-h-screen p-8">
+  <div class="max-w-6xl mx-auto">
+    <h1 class="text-3xl font-bold text-gray-800 mb-6">Data Search</h1>
+    
+    <div id="status" class="text-gray-500 mb-4">Loading DuckDB...</div>
+    
+    <input 
+      type="text" 
+      id="search" 
+      placeholder="Search..." 
+      class="w-full max-w-md px-4 py-3 rounded-lg border border-gray-300 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent mb-6"
+    >
+    
+    <div class="bg-white rounded-lg shadow overflow-hidden">
+      <table class="min-w-full">
+        <thead class="bg-gray-800 text-white">
+          <tr>
+            <th class="px-6 py-4 text-left text-sm font-semibold">EVENTID</th>
+            <th class="px-6 py-4 text-left text-sm font-semibold">VALID_START_TS</th>
+            <th class="px-6 py-4 text-left text-sm font-semibold">Value</th>
+          </tr>
+        </thead>
+        <tbody id="results" class="divide-y divide-gray-200">
+        </tbody>
+      </table>
+    </div>
+    
+    <p id="count" class="text-gray-500 mt-4 text-sm"></p>
+  </div>
+
+  <script type="module">
+    import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm';
+
+    const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
+    const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), new Worker(bundle.mainWorker));
+    await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+    const conn = await db.connect();
+
+    document.getElementById('status').textContent = '✓ Ready';
+    document.getElementById('status').classList.replace('text-gray-500', 'text-green-600');
+
+    document.getElementById('search').addEventListener('input', async (e) => {
+      const term = e.target.value;
+      if (term.length < 2) { 
+        document.getElementById('results').innerHTML = ''; 
+        document.getElementById('count').textContent = '';
+        return; 
+      }
+
+      const result = await conn.query(`
+        SELECT * FROM 'data/data.parquet'
+        WHERE CAST(EVENTID AS VARCHAR) ILIKE '%${term}%'
+           OR CAST(Value AS VARCHAR) ILIKE '%${term}%'
+        LIMIT 100
+      `);
+
+      const rows = result.toArray().map(r => r.toJSON());
+      
+      document.getElementById('results').innerHTML = rows
+        .map(row => `
+          <tr class="hover:bg-gray-50 transition-colors">
+            <td class="px-6 py-4 text-sm text-gray-900">${row.EVENTID}</td>
+            <td class="px-6 py-4 text-sm text-gray-600">${row.VALID_START_TS}</td>
+            <td class="px-6 py-4 text-sm text-gray-600">${row.Value}</td>
+          </tr>
+        `).join('');
+      
+      document.getElementById('count').textContent = `Showing ${rows.length} results`;
+    });
+  </script>
+</body>
+</html>
