@@ -3,6 +3,7 @@
 <head>
   <title>Data Search</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/dist/duckdb-browser-blocking.js"></script>
 </head>
 <body class="bg-gray-100 min-h-screen p-8">
   <div class="max-w-6xl mx-auto">
@@ -13,6 +14,7 @@
       id="search" 
       placeholder="Search (min 2 characters)..." 
       class="w-full max-w-md px-4 py-3 rounded-lg border border-gray-300 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent mb-6"
+      disabled
     >
     <div class="bg-white rounded-lg shadow overflow-hidden">
       <table class="min-w-full">
@@ -30,58 +32,58 @@
     <p id="count" class="text-gray-500 mt-4 text-sm"></p>
   </div>
 
-  <script type="module">
-    import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm';
-
-    // Use local files
-    const bundle = {
-      mainModule: './duckdb/duckdb-mvp.wasm',
-      mainWorker: './duckdb/duckdb-browser-mvp.worker.js'
-    };
-
-    const worker = new Worker(bundle.mainWorker);
-    const logger = new duckdb.ConsoleLogger();
-    const db = new duckdb.AsyncDuckDB(logger, worker);
-    await db.instantiate(bundle.mainModule);
-    const conn = await db.connect();
-
-    document.getElementById('status').textContent = '✓ Ready';
-    document.getElementById('status').classList.replace('text-gray-500', 'text-green-600');
-
-    document.getElementById('search').addEventListener('input', async (e) => {
-      const term = e.target.value.trim();
-      
-      if (term.length < 2) { 
-        document.getElementById('results').innerHTML = ''; 
-        document.getElementById('count').textContent = '';
-        return; 
-      }
-
+  <script>
+    (async () => {
       try {
-        const result = await conn.query(`
-          SELECT * FROM 'data/*.parquet'
-          WHERE CAST(EVENTID AS VARCHAR) ILIKE '%${term}%'
-             OR CAST(Value AS VARCHAR) ILIKE '%${term}%'
-          LIMIT 100
-        `);
+        document.getElementById('status').textContent = 'Initializing...';
+        
+        const duckdb = await window.duckdb.createDuckDB();
+        const conn = await duckdb.connect();
 
-        const rows = result.toArray().map(r => r.toJSON());
-        
-        document.getElementById('results').innerHTML = rows
-          .map(row => `
-            <tr class="hover:bg-gray-50 transition-colors">
-              <td class="px-6 py-4 text-sm text-gray-900">${row.EVENTID}</td>
-              <td class="px-6 py-4 text-sm text-gray-600">${row.VALID_START_TS}</td>
-              <td class="px-6 py-4 text-sm text-gray-600">${row.Value}</td>
-            </tr>
-          `).join('');
-        
-        document.getElementById('count').textContent = `Showing ${rows.length} results`;
+        document.getElementById('status').textContent = '✓ Ready';
+        document.getElementById('status').classList.replace('text-gray-500', 'text-green-600');
+        document.getElementById('search').disabled = false;
+
+        document.getElementById('search').addEventListener('input', async (e) => {
+          const term = e.target.value.trim();
+          
+          if (term.length < 2) { 
+            document.getElementById('results').innerHTML = ''; 
+            document.getElementById('count').textContent = '';
+            return; 
+          }
+
+          try {
+            const result = await conn.query(`
+              SELECT * FROM 'data/*.parquet'
+              WHERE CAST(EVENTID AS VARCHAR) ILIKE '%${term}%'
+                 OR CAST(Value AS VARCHAR) ILIKE '%${term}%'
+              LIMIT 100
+            `);
+
+            const rows = result.toArray();
+            
+            document.getElementById('results').innerHTML = rows
+              .map(row => `
+                <tr class="hover:bg-gray-50 transition-colors">
+                  <td class="px-6 py-4 text-sm text-gray-900">${row.EVENTID}</td>
+                  <td class="px-6 py-4 text-sm text-gray-600">${row.VALID_START_TS}</td>
+                  <td class="px-6 py-4 text-sm text-gray-600">${row.Value}</td>
+                </tr>
+              `).join('');
+            
+            document.getElementById('count').textContent = `Showing ${rows.length} results`;
+          } catch (err) {
+            console.error(err);
+            document.getElementById('count').textContent = 'Query error: ' + err.message;
+          }
+        });
       } catch (err) {
-        console.error(err);
-        document.getElementById('count').textContent = 'Error: ' + err.message;
+        document.getElementById('status').textContent = 'Failed to load DuckDB: ' + err.message;
+        document.getElementById('status').classList.replace('text-gray-500', 'text-red-600');
+        console.error('DuckDB init error:', err);
       }
-    });
+    })();
   </script>
 </body>
 </html>
