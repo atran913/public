@@ -1,0 +1,342 @@
+"""
+Teradata Subclass ID Updater
+- Load CSV mappings (subclassdesc -> id)
+- Fetch records from Teradata
+- Apply mappings to update subclassid
+- Preview changes
+- Export to CSV/Parquet with chunking
+- Commit changes back to Teradata
+"""
+
+import polars as pl
+from pathlib import Path
+from typing import Optional
+import teradatasql
+
+
+class TeradataSubclassUpdater:
+    def __init__(self, connection_params: dict):
+        """
+        connection_params: dict with host, user, password, etc.
+        Example: {"host": "your_host", "user": "your_user", "password": "your_pass"}
+        """
+        self.connection_params = connection_params
+        self.mappings: pl.DataFrame = None
+        self.original_df: pl.DataFrame = None
+        self.updated_df: pl.DataFrame = None
+        self.changes_df: pl.DataFrame = None
+
+    def load_mappings(self, csv_path: str) -> pl.DataFrame:
+        """Load the subclassdesc -> id mapping CSV."""
+        self.mappings = pl.read_csv(csv_path)
+        # Normalize column names
+        self.mappings = self.mappings.rename({
+            col: col.strip().lower() for col in self.mappings.columns
+        })
+        print(f"Loaded {len(self.mappings)} mappings")
+        print(self.mappings.head())
+        return self.mappings
+
+    def fetch_records(self, table_name: str, where_clause: str = None) -> pl.DataFrame:
+        """Fetch all records from Teradata table."""
+        query = f"SELECT * FROM {table_name}"
+        if where_clause:
+            query += f" WHERE {where_clause}"
+
+        with teradatasql.connect(**self.connection_params) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                columns = [desc[0] for desc in cur.description]
+                rows = cur.fetchall()
+
+        self.original_df = pl.DataFrame(rows, schema=columns, orient="row")
+        print(f"Fetched {len(self.original_df)} records")
+        return self.original_df
+
+    def apply_mappings(
+        self,
+        desc_column: str = "subclassdesc",
+        id_column: str = "subclassid",
+        mapping_desc_col: str = "subclassdesc",
+        mapping_id_col: str = "id"
+    ) -> pl.DataFrame:
+        """
+        Update subclassid based on subclassdesc mappings.
+        Only updates records where desc matches a mapping.
+        """
+        if self.original_df is None:
+            raise ValueError("No records loaded. Call fetch_records() first.")
+        if self.mappings is None:
+            raise ValueError("No mappings loaded. Call load_mappings() first.")
+
+        # Create a mapping dict for the join
+        mapping_lookup = self.mappings.select([
+            pl.col(mapping_desc_col).alias("_map_desc"),
+            pl.col(mapping_id_col).alias("_new_id")
+        ])
+
+        # Join and update
+        self.updated_df = (
+            self.original_df
+            .join(
+                mapping_lookup,
+                left_on=desc_column,
+                right_on="_map_desc",
+                how="left"
+            )
+            .with_columns(
+                pl.when(pl.col("_new_id").is_not_null())
+                .then(pl.col("_new_id"))
+                .otherwise(pl.col(id_column))
+                .alias(id_column)
+            )
+            .drop("_new_id")
+        )
+
+        # Track what changed
+        self.changes_df = (
+            self.original_df
+            .select([desc_column, pl.col(id_column).alias("old_id")])
+            .join(
+                self.updated_df.select([desc_column, pl.col(id_column).alias("new_id")]),
+                on=desc_column,
+                how="inner"
+            )
+            .filter(pl.col("old_id") != pl.col("new_id"))
+            .unique()
+        )
+
+        print(f"Applied mappings. {len(self.changes_df)} unique desc values will be updated.")
+        return self.updated_df
+
+    def preview_changes(self, n: int = 20) -> pl.DataFrame:
+        """Preview records that will be changed."""
+        if self.changes_df is None:
+            raise ValueError("No changes to preview. Call apply_mappings() first.")
+
+        print(f"\n=== PREVIEW: {len(self.changes_df)} distinct mappings applied ===")
+        print(self.changes_df.head(n))
+
+        # Show sample of actual records affected
+        if self.original_df is not None and self.updated_df is not None:
+            changed_descs = self.changes_df.get_column("subclassdesc" if "subclassdesc" in self.changes_df.columns else self.changes_df.columns[0])
+            
+            affected_count = self.original_df.filter(
+                pl.col(self.changes_df.columns[0]).is_in(changed_descs)
+            ).height
+            print(f"\nTotal records affected: {affected_count}")
+
+        return self.changes_df
+
+    def save_to_csv(
+        self,
+        output_dir: str,
+        filename_prefix: str = "updated_data",
+        chunk_size: int = 100_000
+    ) -> list[Path]:
+        """Save updated data to CSV files with chunking."""
+        if self.updated_df is None:
+            raise ValueError("No updated data. Call apply_mappings() first.")
+
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        files_written = []
+        total_rows = len(self.updated_df)
+        num_chunks = (total_rows + chunk_size - 1) // chunk_size
+
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = min(start + chunk_size, total_rows)
+            chunk = self.updated_df.slice(start, end - start)
+
+            if num_chunks == 1:
+                filepath = output_path / f"{filename_prefix}.csv"
+            else:
+                filepath = output_path / f"{filename_prefix}_part{i+1:04d}.csv"
+
+            chunk.write_csv(filepath)
+            files_written.append(filepath)
+            print(f"Wrote {filepath} ({len(chunk)} rows)")
+
+        print(f"\nTotal: {len(files_written)} CSV file(s), {total_rows} rows")
+        return files_written
+
+    def save_to_parquet(
+        self,
+        output_dir: str,
+        filename_prefix: str = "updated_data",
+        chunk_size: int = 500_000,
+        compression: str = "snappy"
+    ) -> list[Path]:
+        """Save updated data to Parquet files with chunking."""
+        if self.updated_df is None:
+            raise ValueError("No updated data. Call apply_mappings() first.")
+
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        files_written = []
+        total_rows = len(self.updated_df)
+        num_chunks = (total_rows + chunk_size - 1) // chunk_size
+
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = min(start + chunk_size, total_rows)
+            chunk = self.updated_df.slice(start, end - start)
+
+            if num_chunks == 1:
+                filepath = output_path / f"{filename_prefix}.parquet"
+            else:
+                filepath = output_path / f"{filename_prefix}_part{i+1:04d}.parquet"
+
+            chunk.write_parquet(filepath, compression=compression)
+            files_written.append(filepath)
+            print(f"Wrote {filepath} ({len(chunk)} rows)")
+
+        print(f"\nTotal: {len(files_written)} Parquet file(s), {total_rows} rows")
+        return files_written
+
+    def commit_changes(
+        self,
+        table_name: str,
+        id_column: str = "subclassid",
+        desc_column: str = "subclassdesc",
+        primary_key: str = None,
+        batch_size: int = 1000,
+        dry_run: bool = False
+    ) -> int:
+        """
+        Commit changes back to Teradata.
+        Uses UPDATE statements based on the mapping.
+        
+        If primary_key is provided, updates by PK for precision.
+        Otherwise, updates by desc_column (bulk update all matching rows).
+        """
+        if self.changes_df is None or len(self.changes_df) == 0:
+            print("No changes to commit.")
+            return 0
+
+        updates_executed = 0
+
+        with teradatasql.connect(**self.connection_params) as conn:
+            with conn.cursor() as cur:
+                if primary_key:
+                    # Precise update using primary key
+                    # Get affected records with their PKs
+                    affected = (
+                        self.updated_df
+                        .join(
+                            self.original_df.select([primary_key, id_column]).rename({id_column: "_old_id"}),
+                            on=primary_key,
+                            how="inner"
+                        )
+                        .filter(pl.col(id_column) != pl.col("_old_id"))
+                        .select([primary_key, id_column])
+                    )
+
+                    sql = f"UPDATE {table_name} SET {id_column} = ? WHERE {primary_key} = ?"
+
+                    for batch_start in range(0, len(affected), batch_size):
+                        batch = affected.slice(batch_start, batch_size)
+                        params = [
+                            (row[id_column], row[primary_key])
+                            for row in batch.iter_rows(named=True)
+                        ]
+
+                        if dry_run:
+                            print(f"[DRY RUN] Would execute {len(params)} updates")
+                        else:
+                            cur.executemany(sql, params)
+                            updates_executed += len(params)
+                            print(f"Executed batch: {updates_executed} updates so far")
+
+                else:
+                    # Bulk update by description
+                    sql = f"UPDATE {table_name} SET {id_column} = ? WHERE {desc_column} = ?"
+
+                    params = [
+                        (row["new_id"], row[desc_column])
+                        for row in self.changes_df.iter_rows(named=True)
+                    ]
+
+                    for batch_start in range(0, len(params), batch_size):
+                        batch = params[batch_start:batch_start + batch_size]
+
+                        if dry_run:
+                            print(f"[DRY RUN] Would execute {len(batch)} updates")
+                        else:
+                            cur.executemany(sql, batch)
+                            updates_executed += len(batch)
+                            print(f"Executed batch: {updates_executed} updates so far")
+
+                if not dry_run:
+                    conn.commit()
+                    print(f"\nCommitted {updates_executed} updates to {table_name}")
+
+        return updates_executed
+
+
+# =============================================================================
+# Interactive Mode Setup
+# =============================================================================
+
+def connect(host: str, user: str, password: str, **kwargs) -> TeradataSubclassUpdater:
+    """Create and return a connected updater instance."""
+    global updater
+    conn_params = {"host": host, "user": user, "password": password, **kwargs}
+    updater = TeradataSubclassUpdater(conn_params)
+    print(f"Created updater. Connected to {host}")
+    return updater
+
+
+def help_commands():
+    """Show available commands."""
+    print("""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        TERADATA SUBCLASS UPDATER                             ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  STEP 1: Connect                                                             ║
+║    updater = connect("host", "user", "password")                             ║
+║    updater = connect("host", "user", "password", logmech="LDAP")             ║
+║                                                                              ║
+║  STEP 2: Load mappings CSV                                                   ║
+║    updater.load_mappings("mappings.csv")                                     ║
+║                                                                              ║
+║  STEP 3: Fetch records from Teradata                                         ║
+║    updater.fetch_records("DATABASE.TABLE")                                   ║
+║    updater.fetch_records("DATABASE.TABLE", where_clause="col = 'value'")     ║
+║                                                                              ║
+║  STEP 4: Apply mappings                                                      ║
+║    updater.apply_mappings()  # uses default column names                     ║
+║    updater.apply_mappings(desc_column="SubClassDesc", id_column="SubClassID")║
+║                                                                              ║
+║  STEP 5: Preview changes                                                     ║
+║    updater.preview_changes()                                                 ║
+║    updater.preview_changes(n=100)                                            ║
+║                                                                              ║
+║  STEP 6: Export (optional)                                                   ║
+║    updater.save_to_csv("./output", chunk_size=100000)                        ║
+║    updater.save_to_parquet("./output", chunk_size=500000)                    ║
+║                                                                              ║
+║  STEP 7: Commit changes                                                      ║
+║    updater.commit_changes("DATABASE.TABLE", dry_run=True)   # preview SQL    ║
+║    updater.commit_changes("DATABASE.TABLE", dry_run=False)  # execute!       ║
+║    updater.commit_changes("DATABASE.TABLE", primary_key="id", batch_size=500)║
+║                                                                              ║
+║  INSPECT DATA:                                                               ║
+║    updater.mappings       # view loaded mappings                             ║
+║    updater.original_df    # view original records                            ║
+║    updater.updated_df     # view updated records                             ║
+║    updater.changes_df     # view only changed records                        ║
+║                                                                              ║
+║  Type help_commands() to see this again                                      ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+""")
+
+
+# Global updater instance (set by connect())
+updater: TeradataSubclassUpdater = None
+
+if __name__ == "__main__":
+    help_commands()
